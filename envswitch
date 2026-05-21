@@ -1,0 +1,525 @@
+#!/bin/bash
+# envswitch — alterna blocos e variáveis em um .env usando marcadores explícitos.
+#
+# Uso:
+#   envswitch                       # alterna o último alias usado (ou primeiro disponível)
+#   envswitch <alias>               # bloco: ativa; toggle: cicla para o próximo valor
+#   envswitch <alias>=<valor>       # toggle: define o valor explicitamente
+#   envswitch -f <arquivo> ...      # outro arquivo (default: ./.env)
+#   envswitch -l|--list             # lista blocos e toggles encontrados
+#   envswitch -it|--interactive     # menu interativo para escolher alias/valor
+#   envswitch -h|--help             # ajuda
+#
+# Tipos de marcador:
+#
+#   1) Block switch — alterna blocos completos (DB prod ↔ DB local etc.):
+#
+#      # envswitch:start <alias>
+#      VAR=...
+#      VAR=...
+#      # envswitch:end
+#
+#      O bloco escolhido fica descomentado; os demais ficam comentados com "# ".
+#
+#   2) Toggle — alterna o valor de uma única variável (marcador na linha acima):
+#
+#      # envswitch:toggle querylog
+#      QUERY_LOG=false
+#
+#      # envswitch:toggle loglevel debug|info|warning|error
+#      LOG_LEVEL=debug
+#
+#      Sem lista de valores, o default é "true|false".
+#      'envswitch <alias>' cicla; 'envswitch <alias>=<valor>' define direto.
+#
+# Aliases devem ser únicos entre blocos e toggles.
+
+set -eo pipefail
+
+ENV_FILE="./.env"
+ARG=""
+LIST_ONLY=0
+INTERACTIVE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--file)
+            ENV_FILE="$2"
+            shift 2
+            ;;
+        -l|--list)
+            LIST_ONLY=1
+            shift
+            ;;
+        -it|-i|--interactive)
+            INTERACTIVE=1
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,34p' "$0"
+            exit 0
+            ;;
+        -*)
+            echo "envswitch: opção desconhecida: $1" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -n "$ARG" ]]; then
+                echo "envswitch: aceita apenas um argumento" >&2
+                exit 1
+            fi
+            ARG="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ ! -f "$ENV_FILE" ]]; then
+    echo "envswitch: arquivo não encontrado: $ENV_FILE" >&2
+    exit 1
+fi
+
+TARGET_ALIAS=""
+TARGET_VALUE=""
+if [[ -n "$ARG" ]]; then
+    if [[ "$ARG" == *"="* ]]; then
+        TARGET_ALIAS="${ARG%%=*}"
+        TARGET_VALUE="${ARG#*=}"
+    else
+        TARGET_ALIAS="$ARG"
+    fi
+fi
+
+# ── Leitura de blocos ────────────────────────────────────────────────────────
+read_blocks() {
+    awk '
+        /^[[:space:]]*#[[:space:]]*envswitch:start[[:space:]]+/ {
+            alias = $0
+            sub(/^[[:space:]]*#[[:space:]]*envswitch:start[[:space:]]+/, "", alias)
+            sub(/[[:space:]]+$/, "", alias)
+            in_block = 1
+            has_active = 0
+            has_any = 0
+            next
+        }
+        /^[[:space:]]*#[[:space:]]*envswitch:end[[:space:]]*$/ {
+            if (in_block) {
+                print alias "\t" (has_active ? "active" : (has_any ? "inactive" : "empty"))
+            }
+            in_block = 0
+            next
+        }
+        in_block {
+            if ($0 ~ /^[[:space:]]*$/) { next }
+            has_any = 1
+            if ($0 ~ /^[[:space:]]*#/) { next }
+            has_active = 1
+        }
+    ' "$ENV_FILE"
+}
+
+# ── Leitura de toggles inline ────────────────────────────────────────────────
+# Formato saída: alias|valor_atual|valores_disponíveis|KEY
+read_toggles() {
+    awk '
+        /^[[:space:]]*#[[:space:]]*envswitch:toggle[[:space:]]+/ {
+            marker = $0
+            sub(/^[[:space:]]*#[[:space:]]*envswitch:toggle[[:space:]]+/, "", marker)
+            sub(/[[:space:]]+$/, "", marker)
+            n = split(marker, parts, /[[:space:]]+/)
+            pending_alias = parts[1]
+            pending_values = (n >= 2) ? parts[2] : "true|false"
+            next
+        }
+        pending_alias != "" {
+            kv = $0
+            sub(/^[[:space:]]+/, "", kv)
+            sub(/[[:space:]]+$/, "", kv)
+            if (kv ~ /^[^=[:space:]]+=/) {
+                eq = index(kv, "=")
+                key = substr(kv, 1, eq - 1)
+                value = substr(kv, eq + 1)
+                print pending_alias "\t" value "\t" pending_values "\t" key
+            }
+            pending_alias = ""
+            pending_values = ""
+        }
+    ' "$ENV_FILE"
+}
+
+BLOCKS=()
+while IFS= read -r __l; do BLOCKS+=("$__l"); done < <(read_blocks)
+
+TOGGLES=()
+while IFS= read -r __l; do TOGGLES+=("$__l"); done < <(read_toggles)
+
+if [[ ${#BLOCKS[@]} -eq 0 && ${#TOGGLES[@]} -eq 0 ]]; then
+    echo "envswitch: nenhum marcador encontrado em $ENV_FILE." >&2
+    echo "envswitch: use '# envswitch:start <alias>' / '# envswitch:end' ou '# envswitch:toggle <alias> [v1|v2|...]'." >&2
+    exit 1
+fi
+
+# Mapas auxiliares.
+block_aliases=()
+block_status=()
+if [[ ${#BLOCKS[@]} -gt 0 ]]; then
+    for e in "${BLOCKS[@]}"; do
+        IFS=$'\t' read -r ba bs <<<"$e"
+        block_aliases+=("$ba")
+        block_status+=("$bs")
+    done
+fi
+
+active_blocks=()
+for i in "${!block_aliases[@]}"; do
+    [[ "${block_status[$i]}" == "active" ]] && active_blocks+=("${block_aliases[$i]}")
+done
+current_block=""
+if [[ ${#active_blocks[@]} -gt 0 ]]; then
+    current_block="${active_blocks[$((${#active_blocks[@]} - 1))]}"
+fi
+
+toggle_aliases=()
+toggle_values_now=()
+toggle_values_opts=()
+toggle_keys=()
+if [[ ${#TOGGLES[@]} -gt 0 ]]; then
+    for e in "${TOGGLES[@]}"; do
+        IFS=$'\t' read -r ta tv to tk <<<"$e"
+        toggle_aliases+=("$ta")
+        toggle_values_now+=("$tv")
+        toggle_values_opts+=("$to")
+        toggle_keys+=("$tk")
+    done
+fi
+
+# ── --list ───────────────────────────────────────────────────────────────────
+if [[ "$LIST_ONLY" -eq 1 ]]; then
+    echo "Arquivo: $ENV_FILE"
+    if [[ ${#BLOCKS[@]} -gt 0 ]]; then
+        echo "Blocos (ativo: ${current_block:-<nenhum>}):"
+        for i in "${!block_aliases[@]}"; do
+            marker=" "
+            [[ "${block_aliases[$i]}" == "$current_block" ]] && marker="*"
+            printf "  %s %-20s [%s]\n" "$marker" "${block_aliases[$i]}" "${block_status[$i]}"
+        done
+    fi
+    if [[ ${#TOGGLES[@]} -gt 0 ]]; then
+        echo "Toggles:"
+        for i in "${!toggle_aliases[@]}"; do
+            printf "  - %-20s atual=%s opções=%s\n" \
+                "${toggle_aliases[$i]}" "${toggle_values_now[$i]}" "${toggle_values_opts[$i]}"
+        done
+    fi
+    exit 0
+fi
+
+# ── Menu navegável com setas (↑↓) e Enter ───────────────────────────────────
+# Define PICK_RESULT = índice escolhido (0-based) ou "" se cancelado.
+pick_menu() {
+    local title="$1"; shift
+    local items=("$@")
+    local n=${#items[@]}
+    local cur=0
+    PICK_RESULT=""
+
+    if [[ "$n" -eq 0 ]]; then
+        return 0
+    fi
+
+    # Sem TTY: fallback para select numerado.
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo "$title" >&2
+        local PS3_BAK="${PS3-}"
+        PS3="> "
+        local choice
+        select choice in "${items[@]}" "cancelar"; do
+            PS3="$PS3_BAK"
+            if [[ "$choice" == "cancelar" || -z "$choice" ]]; then
+                PICK_RESULT=""
+                return 0
+            fi
+            PICK_RESULT=$((REPLY - 1))
+            return 0
+        done
+        return 0
+    fi
+
+    local highlight=$'\033[7m'   # reverso
+    local reset=$'\033[0m'
+    local hide_cursor=$'\033[?25l'
+    local show_cursor=$'\033[?25h'
+
+    # restaura cursor em qualquer saída
+    trap 'printf "%s" "'"$show_cursor"'"' EXIT INT TERM
+
+    printf "%s\n" "$title"
+    printf "%s(↑/↓ para navegar, Enter para confirmar, q/Esc para cancelar)%s\n" $'\033[2m' "$reset"
+    printf "%s" "$hide_cursor"
+
+    local i
+    for ((i = 0; i < n; i++)); do
+        if [[ $i -eq $cur ]]; then
+            printf "%s> %s%s\n" "$highlight" "${items[$i]}" "$reset"
+        else
+            printf "  %s\n" "${items[$i]}"
+        fi
+    done
+
+    while true; do
+        local key rest=""
+        IFS= read -rsn1 key
+        if [[ "$key" == $'\x1b' ]]; then
+            # ESC sozinho (bare) ou início de sequência de seta.
+            # Setas chegam como 3 bytes contíguos; ESC alone fica sem mais bytes.
+            # Usa timeout inteiro (bash 3.2 não aceita fracionário em -t).
+            local b1="" b2=""
+            IFS= read -rsn1 -t 1 b1 || b1=""
+            if [[ "$b1" == "[" ]]; then
+                IFS= read -rsn1 -t 1 b2 || b2=""
+                case "$b2" in
+                    "A") cur=$(( (cur - 1 + n) % n )) ;;
+                    "B") cur=$(( (cur + 1) % n )) ;;
+                    *) ;;
+                esac
+            else
+                PICK_RESULT=""
+                printf "%s" "$show_cursor"
+                trap - EXIT INT TERM
+                return 0
+            fi
+        elif [[ -z "$key" ]]; then
+            # Enter
+            PICK_RESULT="$cur"
+            printf "%s" "$show_cursor"
+            trap - EXIT INT TERM
+            return 0
+        elif [[ "$key" == "q" || "$key" == "Q" ]]; then
+            PICK_RESULT=""
+            printf "%s" "$show_cursor"
+            trap - EXIT INT TERM
+            return 0
+        elif [[ "$key" == "k" ]]; then
+            cur=$(( (cur - 1 + n) % n ))
+        elif [[ "$key" == "j" ]]; then
+            cur=$(( (cur + 1) % n ))
+        fi
+
+        # redesenha: sobe n linhas e redesenha cada uma
+        printf '\033[%sA' "$n"
+        for ((i = 0; i < n; i++)); do
+            printf '\033[2K'
+            if [[ $i -eq $cur ]]; then
+                printf "%s> %s%s\n" "$highlight" "${items[$i]}" "$reset"
+            else
+                printf "  %s\n" "${items[$i]}"
+            fi
+        done
+    done
+}
+
+if [[ "$INTERACTIVE" -eq 1 ]]; then
+    if [[ -n "$ARG" ]]; then
+        echo "envswitch: --interactive não aceita argumento posicional." >&2
+        exit 1
+    fi
+
+    menu_labels=()
+    menu_kinds=()
+    menu_idx=()
+    for i in "${!block_aliases[@]}"; do
+        ind=" "
+        [[ "${block_aliases[$i]}" == "$current_block" ]] && ind="*"
+        menu_labels+=("[bloco]  $ind ${block_aliases[$i]}  (${block_status[$i]})")
+        menu_kinds+=("block")
+        menu_idx+=("$i")
+    done
+    for i in "${!toggle_aliases[@]}"; do
+        menu_labels+=("[toggle]   ${toggle_keys[$i]}=${toggle_values_now[$i]}  →  ${toggle_values_opts[$i]}")
+        menu_kinds+=("toggle")
+        menu_idx+=("$i")
+    done
+
+    if [[ ${#menu_labels[@]} -eq 0 ]]; then
+        echo "envswitch: nada para selecionar." >&2
+        exit 1
+    fi
+
+    pick_menu "Arquivo: $ENV_FILE — selecione o que alternar:" "${menu_labels[@]}"
+    if [[ -z "$PICK_RESULT" ]]; then
+        echo "envswitch: cancelado."
+        exit 0
+    fi
+    sel="$PICK_RESULT"
+    kind="${menu_kinds[$sel]}"
+    idx="${menu_idx[$sel]}"
+
+    if [[ "$kind" == "block" ]]; then
+        TARGET_ALIAS="${block_aliases[$idx]}"
+    else
+        # toggle selecionado: cicla para o próximo valor automaticamente.
+        TARGET_ALIAS="${toggle_aliases[$idx]}"
+        # TARGET_VALUE vazio → o bloco de execução do toggle cicla naturalmente.
+    fi
+fi
+
+# ── Resolução do alvo ────────────────────────────────────────────────────────
+# Procura o alias entre blocos primeiro, depois entre toggles.
+if [[ -z "${kind:-}" ]]; then
+    kind=""
+    idx=-1
+fi
+if [[ -n "$kind" ]]; then
+    :
+elif [[ -n "$TARGET_ALIAS" ]]; then
+    for i in "${!block_aliases[@]}"; do
+        if [[ "${block_aliases[$i]}" == "$TARGET_ALIAS" ]]; then kind="block"; idx=$i; break; fi
+    done
+    if [[ -z "$kind" ]]; then
+        for i in "${!toggle_aliases[@]}"; do
+            if [[ "${toggle_aliases[$i]}" == "$TARGET_ALIAS" ]]; then kind="toggle"; idx=$i; break; fi
+        done
+    fi
+    if [[ -z "$kind" ]]; then
+        available=""
+        [[ ${#block_aliases[@]} -gt 0 ]] && available="blocos: ${block_aliases[*]}"
+        if [[ ${#toggle_aliases[@]} -gt 0 ]]; then
+            [[ -n "$available" ]] && available="$available | "
+            available="${available}toggles: ${toggle_aliases[*]}"
+        fi
+        echo "envswitch: alias '$TARGET_ALIAS' não encontrado. Disponíveis — $available" >&2
+        exit 1
+    fi
+else
+    # sem alias: alterna o primeiro bloco (se houver) ou o primeiro toggle
+    if [[ ${#block_aliases[@]} -gt 1 ]]; then
+        kind="block"
+        next_idx=0
+        for i in "${!block_aliases[@]}"; do
+            if [[ "${block_aliases[$i]}" == "$current_block" ]]; then
+                next_idx=$(( (i + 1) % ${#block_aliases[@]} ))
+                break
+            fi
+        done
+        idx=$next_idx
+        TARGET_ALIAS="${block_aliases[$idx]}"
+    elif [[ ${#toggle_aliases[@]} -ge 1 ]]; then
+        kind="toggle"
+        idx=0
+        TARGET_ALIAS="${toggle_aliases[$idx]}"
+    else
+        echo "envswitch: nada para alternar (apenas um bloco e nenhum toggle)." >&2
+        exit 1
+    fi
+fi
+
+# ── Execução ────────────────────────────────────────────────────────────────
+tmp=$(mktemp)
+
+if [[ "$kind" == "block" ]]; then
+    if [[ -n "$TARGET_VALUE" ]]; then
+        echo "envswitch: alias de bloco '$TARGET_ALIAS' não aceita '=<valor>'." >&2
+        rm -f "$tmp"
+        exit 1
+    fi
+
+    awk -v target="$TARGET_ALIAS" '
+        function activate(line,    s) {
+            s = line
+            sub(/^[[:space:]]*#[[:space:]]?/, "", s)
+            return s
+        }
+        function deactivate(line) {
+            if (line ~ /^[[:space:]]*#/) { return line }
+            return "# " line
+        }
+
+        /^[[:space:]]*#[[:space:]]*envswitch:start[[:space:]]+/ {
+            alias = $0
+            sub(/^[[:space:]]*#[[:space:]]*envswitch:start[[:space:]]+/, "", alias)
+            sub(/[[:space:]]+$/, "", alias)
+            in_block = 1
+            is_target = (alias == target)
+            print
+            next
+        }
+        /^[[:space:]]*#[[:space:]]*envswitch:end[[:space:]]*$/ {
+            in_block = 0
+            is_target = 0
+            print
+            next
+        }
+        {
+            if (in_block && $0 !~ /^[[:space:]]*$/) {
+                if (is_target) { print activate($0) } else { print deactivate($0) }
+                next
+            }
+            print
+        }
+    ' "$ENV_FILE" > "$tmp"
+
+    mv "$tmp" "$ENV_FILE"
+    echo "envswitch: bloco $TARGET_ALIAS ativado (antes: ${current_block:-<nenhum>})"
+
+else
+    # toggle
+    current_value="${toggle_values_now[$idx]}"
+    options="${toggle_values_opts[$idx]}"
+
+    if [[ -z "$TARGET_VALUE" ]]; then
+        # cicla para o próximo valor da lista
+        IFS='|' read -ra opts_arr <<<"$options"
+        next_idx=0
+        for i in "${!opts_arr[@]}"; do
+            if [[ "${opts_arr[$i]}" == "$current_value" ]]; then
+                next_idx=$(( (i + 1) % ${#opts_arr[@]} ))
+                break
+            fi
+        done
+        TARGET_VALUE="${opts_arr[$next_idx]}"
+    else
+        # valida se está na lista (se houver lista explícita)
+        valid=0
+        IFS='|' read -ra opts_arr <<<"$options"
+        for v in "${opts_arr[@]}"; do
+            [[ "$v" == "$TARGET_VALUE" ]] && valid=1
+        done
+        if [[ "$valid" -eq 0 ]]; then
+            echo "envswitch: valor '$TARGET_VALUE' inválido para '$TARGET_ALIAS'. Opções: $options" >&2
+            rm -f "$tmp"
+            exit 1
+        fi
+    fi
+
+    awk -v target="$TARGET_ALIAS" -v newval="$TARGET_VALUE" '
+        /^[[:space:]]*#[[:space:]]*envswitch:toggle[[:space:]]+/ {
+            marker = $0
+            sub(/^[[:space:]]*#[[:space:]]*envswitch:toggle[[:space:]]+/, "", marker)
+            sub(/[[:space:]]+$/, "", marker)
+            split(marker, parts, /[[:space:]]+/)
+            pending = (parts[1] == target) ? 1 : 0
+            print
+            next
+        }
+        pending == 1 {
+            kv = $0
+            indent = ""
+            if (match(kv, /^[[:space:]]+/)) {
+                indent = substr(kv, 1, RLENGTH)
+                kv = substr(kv, RLENGTH + 1)
+            }
+            eq = index(kv, "=")
+            if (eq > 0) {
+                key = substr(kv, 1, eq - 1)
+                print indent key "=" newval
+                pending = 0
+                next
+            }
+            pending = 0
+        }
+        { print }
+    ' "$ENV_FILE" > "$tmp"
+
+    mv "$tmp" "$ENV_FILE"
+    echo "envswitch: ${toggle_keys[$idx]}=$TARGET_VALUE (antes: $current_value)"
+fi
