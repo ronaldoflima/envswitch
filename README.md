@@ -9,9 +9,9 @@ Compatível com macOS (bash 3.2) e Linux. Sem dependências além de `bash` e `a
 ## Instalação
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ronaldoflima/envswitch/main/envswitch \
-  -o /usr/local/bin/envswitch
-chmod +x /usr/local/bin/envswitch
+curl -fsSL https://raw.githubusercontent.com/ronaldoflima/envswitch/main/envswitch -o /tmp/envswitch && \
+chmod +x /tmp/envswitch && \
+sudo mv /tmp/envswitch /usr/local/bin/envswitch
 ```
 
 Ou clone e crie um symlink onde preferir:
